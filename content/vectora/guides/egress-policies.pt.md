@@ -7,8 +7,8 @@ Este guia explica como o Vectora controla o tráfego de saída do agente: a pol�
 vale para as ferramentas de rede, e o isolamento de rede do sandbox, que vale para os comandos
 executados no worker.
 
-> **Status:** estas capacidades estão incluídas na versão 0.1.24. Testes live marcados como
-> `skipped` não comprovam funcionamento em ambiente real.
+> **Status:** a política de egress das ferramentas está na versão 0.1.24; a rede filtrada do sandbox
+> chega na 0.1.28. Testes live marcados como `skipped` não comprovam funcionamento em ambiente real.
 
 ## Pré-requisitos
 
@@ -63,23 +63,28 @@ Subagentes herdam a política da execução que os criou.
 
 ### Rede do sandbox
 
-Quando o sandbox está ativo, a seção `[sandbox]` controla a rede dos comandos:
+Quando o sandbox está ativo, a política do sandbox (a sua, fora do repositório; veja
+[Sandbox](../../concepts/sandbox)) controla a rede dos comandos:
 
 ```toml
 [sandbox]
 enabled = true
-backend = "local"
-lockdown = false
-allow_tcp_ports = [443]
+network = "filtered"                    # off | filtered | open
+allow_hosts = ["api.exemplo.com"]       # além dos registries de pacotes
+registry_hosts = true
+allow_tcp_ports = [443]                 # restrição extra por porta (Landlock)
 ```
 
-- `lockdown = true` nega toda a rede do worker (`--unshare-net`) quando ele roda sob `bwrap` (Linux,
-  ou Windows via WSL2).
-- `allow_tcp_ports` nega todo TCP de saída, exceto as portas listadas. A restrição usa Landlock ABI
-  V4 e exige Linux com kernel 6.7 ou superior. O ruleset também trata bind TCP, mas concede apenas
-  connect: um servidor local não consegue fazer bind nem em uma porta listada quando essa restrição
-  está ativa.
-- Com `allow_tcp_ports` vazio (o padrão), o sandbox não restringe a rede por porta.
+- `network = "filtered"` (padrão): o jail não tem rota de rede e só alcança o proxy de saída, que
+  aceita `CONNECT` HTTPS para os registries de pacotes e os `allow_hosts`, recusa IP privado,
+  loopback e metadados, só abre as portas 80 e 443 e conecta ao IP já validado. Cada decisão fica
+  registrada.
+- `network = "off"` ou `lockdown = true`: sem rede (`--unshare-net`).
+- `network = "open"`: rede do host, sem filtro.
+- `allow_tcp_ports` nega todo TCP de saída, exceto as portas listadas, por Landlock ABI V4 (Linux
+  6.7 ou superior). Com a lista vazia (o padrão) não há restrição por porta.
+
+O `vectora.toml` do repositório só pode fechar a rede e estreitar `allow_hosts`.
 
 Antes de usar essas capacidades, confira os limites de plataforma, configuração e validação abaixo.
 
@@ -87,7 +92,8 @@ Antes de usar essas capacidades, confira os limites de plataforma, configuraçã
 
 - O backend `local` do sandbox (bubblewrap e Landlock) funciona em Linux; no Windows, depende de
   WSL2. Sem WSL2, ou sem `bwrap` na distribuição, o worker cai num modo soft que não aplica
-  `--unshare-net`: com `lockdown = true`, os comandos continuam rodando e a rede fica aberta.
+  `--unshare-net`: com `lockdown = true`, os comandos continuam rodando e a rede fica aberta. No
+  WSL2 a rede filtrada não está disponível (o proxy roda no host Windows): a rede fica aberta.
 - No macOS o sandbox não liga sozinho, e o worker persistente não usa o Seatbelt (`sandbox-exec`).
 - Em kernels sem Landlock ABI V4, `allow_tcp_ports` não é aplicado; o worker registra que a
   restrição não está em vigor.

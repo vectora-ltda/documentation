@@ -19,29 +19,77 @@ arquivo e terminal (isso anularia o propósito de um agente de código autônomo
 
 ## Ativação por workspace
 
-O Sandbox é configurado por workspace. Se o workspace **não tem** `vectora.toml`, o Vectora liga o
-sandbox sozinho quando o ambiente suporta isolamento nativo (`bwrap` no Linux, WSL2 no Windows); sem
-esse suporte, e sempre no macOS, ele fica desligado. Se o workspace tem `vectora.toml`, vale a seção
-`[sandbox]`:
+Se o workspace **não tem** `vectora.toml` e você não definiu uma política, o Vectora liga o sandbox
+sozinho quando o ambiente suporta isolamento nativo (`bwrap` no Linux, WSL2 no Windows); sem esse
+suporte, e sempre no macOS, ele fica desligado. Se o workspace tem `vectora.toml` sem a seção
+`[sandbox]`, o sandbox fica desligado e o workspace se comporta como antes dessa feature existir.
+
+### Quem define a política
+
+A política que **amplia** o acesso do jail é sua, não do repositório. Um repositório clonado pode
+trazer qualquer `vectora.toml`, então o Vectora guarda a sua política **fora do workspace**, em
+`~/.vectora/sandbox-policies/` (um arquivo por workspace), e a edita pela API
+`GET`/`PUT /workspaces/{id}/sandbox/policy` (a gravação exige workspace confiado).
+
+O `[sandbox]` do `vectora.toml` do repositório só pode **restringir**:
+
+- liga o sandbox e o `lockdown`, exige isolamento completo, acrescenta máscaras, desliga GPU;
+- estreita `rw_paths`, `ro_paths`, `env_pass`, `allow_hosts`, `allow_tcp_ports` e `git_writable`, e
+  muda a rede para um modo mais fechado.
+
+O que ele pede e **amplia** (um caminho gravável novo, `env_pass`, `git_writable`, rede mais aberta,
+outro `backend`, `docker_image`, `remote_host`) é ignorado, registrado no log e listado em
+`ignored_repo_keys` na resposta da política. Desligar o sandbox que você ligou também é ignorado.
 
 ```toml
+# Política do usuário (a mesma tabela que o repositório pode usar para restringir)
 [sandbox]
 enabled = true
-backend = "local"          # local (bwrap, Linux) | docker | ssh | modal
-rw_paths = ["."]           # graváveis dentro da jaula
-ro_paths = []               # só leitura dentro da jaula
+rw_paths = ["/dados"]            # graváveis dentro da jaula, além do workspace
+ro_paths = []                    # só leitura
 mask = [".env", "**/*.pem", "**/.ssh/**", "**/.aws/**"]
-no_gpu = true
-lockdown = false            # true: fail-closed em qualquer ambiguidade de política
+env_pass = ["NPM_TOKEN"]         # variáveis do host que o jail pode herdar
+git_writable = false             # true libera a escrita em .git/hooks e .git/config
+network = "filtered"             # off | filtered | open
+allow_hosts = ["api.exemplo.com", "*.cdn.exemplo.com"]
+registry_hosts = true            # pip, npm, cargo, go, maven, composer e GitHub
+lockdown = false                 # true: sem rede, perfil restrito de recursos
+require_full_isolation = false   # true: não inicia sem seccomp e Landlock
 ```
 
-Se o `vectora.toml` existe sem a seção `[sandbox]`, o sandbox fica desligado e o workspace se
-comporta exatamente como antes dessa feature existir. TOML malformado ou um campo inválido, uma vez
-que `[sandbox]` está presente, falha **fechado** (lockdown) em vez de rodar desprotegido
-silenciosamente.
+TOML malformado, ou um campo com tipo inválido (por exemplo, uma string no lugar de uma lista),
+falha **fechado** (lockdown) em vez de rodar desprotegido.
 
-Para o controle de rede do worker (`lockdown` e `allow_tcp_ports`) e para a política de egress das
-ferramentas de rede, veja [Políticas de egress](../../guides/egress-policies).
+## O que o jail enxerga
+
+- O sistema (`/usr`, `/bin`, `/lib`, `/lib64`, `/etc`) somente leitura, com os links simbólicos do
+  host, e um `/tmp` próprio.
+- O ambiente virtual do Python e o pacote `backend`, somente leitura. O restante do repositório do
+  Vectora não é exposto.
+- Um `$HOME` vazio em tmpfs. Nada do seu home aparece.
+- **Ambiente limpo:** só `PATH`, `HOME` do jail, `LANG`, `TERM`, `TZ` e o que você liberar em
+  `env_pass`. Chaves de provider e tokens do backend nunca chegam ao jail.
+- Sessão nova, sem terminal de controle, e `no_new_privs`.
+- `.git/hooks` e `.git/config` somente leitura (um hook gravado pelo agente rodaria fora do jail no
+  seu próximo `git`); commits e branches continuam funcionando.
+
+## Rede
+
+O jail não tem rota de rede própria. No modo padrão, `filtered`, ele só alcança um proxy de saída
+que roda fora do jail e decide cada conexão HTTPS (`CONNECT`) pela allowlist: os registries de
+pacotes (se `registry_hosts` estiver ligado) mais os seus `allow_hosts`. O proxy recusa IP privado,
+loopback e endereços de metadados, só aceita as portas 80 e 443, conecta ao IP já validado (sem
+resolver o nome de novo, contra DNS rebinding) e registra cada decisão. HTTP sem TLS é recusado.
+
+| Modo       | Efeito                                                                       |
+| ---------- | ---------------------------------------------------------------------------- |
+| `filtered` | Só os destinos permitidos, pelo proxy (padrão)                               |
+| `off`      | Sem rede                                                                     |
+| `open`     | Rede do host, sem filtro. Use só quando precisar; qualquer coisa sai por ela |
+
+`lockdown = true` sempre corta a rede. No WSL2 o proxy não é alcançável pela distro, então a rede
+fica aberta e o Vectora registra o aviso. Detalhes da política de egress das ferramentas em
+[Políticas de egress](../../guides/egress-policies).
 
 ## Como funciona: um worker por workspace
 
@@ -56,10 +104,13 @@ No backend `local` (Linux, ou Windows via WSL2), o worker roda sob `bwrap` quand
 
 - Namespacing de filesystem restrito a `rw_paths`/`ro_paths`.
 - Paths mascarados (`mask`) nunca expostos dentro da jaula, mesmo se caírem sob um path permitido.
-- Um filtro seccomp-BPF real (via `libseccomp`) negando uma lista fixa de syscalls perigosas
-  (`ptrace`, `mount`, `unshare`, `bpf`, carregamento de módulo de kernel, etc.) — se `libseccomp`
-  não estiver instalado no host, o worker ainda roda sob isolamento de namespace, só sem o filtro de
-  syscall, e essa degradação é registrada em log.
+- Landlock e limites de recursos aplicados pelo próprio worker.
+- Um filtro seccomp-BPF (via `pyseccomp`/`libseccomp`) negando syscalls perigosas: `ptrace`,
+  `mount`, `unshare`, `setns`, `bpf`, módulos de kernel, `io_uring`, `userfaultfd`, `keyctl`,
+  `perf_event_open`, `ioctl(TIOCSTI)` e a criação de namespaces por `clone`. Sem `libseccomp` o
+  worker roda sem o filtro e o isolamento fica **parcial**; com `require_full_isolation = true` ele
+  nem inicia.
+- Mudou a pasta ou a política do workspace, o worker é recriado na próxima ação.
 
 No Windows, a ativação automática verifica uma distribuição WSL2 elegível, não a presença de `bwrap`
 dentro dela. Se `bwrap` estiver ausente, o worker usa um processo soft nativo sem isolamento de
@@ -73,12 +124,11 @@ substituição por worker soft é recusada.
 Os demais backends (`docker`, `ssh`, `modal`) rodam o mesmo modelo de worker contra seu respectivo
 primitivo de isolamento; `docker` também nega acesso a rede sob `lockdown`.
 
-## Limitação conhecida: terminal interativo
+## Terminal interativo
 
-A chamada pontual da tool `terminal` e as tools de arquivo já são sandboxed hoje. Uma sessão de
-terminal **interativa** (a aba Terminal, baseada em PTY) ainda não é roteada pelo worker jailado —
-iniciar um terminal interativo num workspace sandboxed retorna um erro claro em vez de cair
-silenciosamente pra um shell sem sandbox. Está previsto pra uma iteração futura.
+A aba Terminal (PTY) roda no mesmo jail `bwrap` do backend `local`, com o mesmo ambiente limpo e a
+mesma rede filtrada. Nos backends `docker`, `ssh` e `modal` ela ainda não é suportada: iniciar o
+terminal interativo retorna um erro claro em vez de cair num shell sem proteção.
 
 ## Veja também
 

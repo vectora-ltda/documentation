@@ -24,10 +24,10 @@ Outbound traffic is controlled by two independent layers, each configured in a d
 
 ### Two layers
 
-| Layer           | Where it applies                                                                                                           | How it is configured                      |
-| --------------- | -------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
-| Egress policy   | Initial URLs for fetch, crawl and map, and Browser Workbench navigation; see Chromium redirect and search exclusions below | Runtime settings (`egress_policy`)        |
-| Sandbox network | Commands and files run in the jailed worker                                                                                | The `[sandbox]` section of `vectora.toml` |
+| Layer           | Where it applies                                                                                                           | How it is configured                                   |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| Egress policy   | Initial URLs for fetch, crawl and map, and Browser Workbench navigation; see Chromium redirect and search exclusions below | Runtime settings (`egress_policy`)                     |
+| Sandbox network | Commands and files run in the jailed worker                                                                                | Your sandbox policy (the repository can only restrict) |
 
 The MCP server allowlist and tool pre-approvals are not egress policies. They control which servers
 and actions can be used, not where traffic goes.
@@ -63,22 +63,28 @@ Subagents inherit the policy of the run that created them.
 
 ### Sandbox network
 
-When the sandbox is active, the `[sandbox]` section controls the network for commands:
+When the sandbox is active, the sandbox policy (yours, outside the repository; see
+[Sandbox](../../concepts/sandbox)) controls the network of commands:
 
 ```toml
 [sandbox]
 enabled = true
-backend = "local"
-lockdown = false
-allow_tcp_ports = [443]
+network = "filtered"                    # off | filtered | open
+allow_hosts = ["api.example.com"]       # besides package registries
+registry_hosts = true
+allow_tcp_ports = [443]                 # extra per-port restriction (Landlock)
 ```
 
-- `lockdown = true` denies all network access for the worker (`--unshare-net`) when it runs under
-  `bwrap` (Linux, or Windows through WSL2).
-- `allow_tcp_ports` denies all outbound TCP except the listed ports. The restriction uses Landlock
-  ABI V4 and requires Linux with kernel 6.7 or later. The ruleset also handles TCP bind but grants
-  only connect: a local server cannot bind even to a listed port when this restriction is active.
-- With `allow_tcp_ports` empty (the default), the sandbox does not restrict the network by port.
+- `network = "filtered"` (default): the jail has no network route and only reaches the egress proxy,
+  which accepts HTTPS `CONNECT` to package registries and `allow_hosts`, refuses private, loopback
+  and metadata addresses, only opens ports 80 and 443, and connects to the already validated IP.
+  Every decision is recorded.
+- `network = "off"` or `lockdown = true`: no network (`--unshare-net`).
+- `network = "open"`: the host network, unfiltered.
+- `allow_tcp_ports` denies all outbound TCP except the listed ports, through Landlock ABI V4 (Linux
+  6.7 or later). With the list empty (the default) there is no per-port restriction.
+
+The repository's `vectora.toml` can only close the network and narrow `allow_hosts`.
 
 Before using these capabilities, check the platform, configuration and validation limits below.
 
@@ -87,7 +93,8 @@ Before using these capabilities, check the platform, configuration and validatio
 - The sandbox `local` backend (bubblewrap and Landlock) runs on Linux; on Windows it depends on
   WSL2. Without WSL2, or without `bwrap` inside the distribution, the worker falls back to a soft
   mode that does not apply `--unshare-net`: with `lockdown = true`, commands still run and the
-  network stays open.
+  network stays open. On WSL2 the filtered network is not available (the proxy runs on the Windows
+  host): the network stays open.
 - On macOS the sandbox does not turn on automatically, and the persistent worker does not use
   Seatbelt (`sandbox-exec`).
 - On kernels without Landlock ABI V4, `allow_tcp_ports` is not applied; the worker logs that the

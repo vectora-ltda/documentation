@@ -74,6 +74,20 @@ fails **closed** (locked down) instead of running unprotected.
 - `.git/hooks` and `.git/config` read-only (a hook written by the agent would run outside the jail
   on your next `git`); commits and branches keep working.
 
+## Resource limits
+
+Every process in the jail inherits limits a runaway agent cannot exceed:
+
+| Field             | Default  | Effect                                                                |
+| ----------------- | -------- | --------------------------------------------------------------------- |
+| `max_file_mb`     | `4096`   | Largest file the jail writes (`RLIMIT_FSIZE`)                         |
+| `memory_limit_mb` | no limit | Per-process memory ceiling (`RLIMIT_AS`), when declared               |
+| `tmp_size_mb`     | `1024`   | Size of the jail's `/tmp` and `$HOME` (tmpfs); needs a recent `bwrap` |
+
+`RLIMIT_NPROC`, `RLIMIT_NOFILE` and `RLIMIT_CORE=0` also apply (with stricter profiles under
+`lockdown`). The repository's `vectora.toml` can only **lower** these limits. There is no CPU limit
+or cgroup: without privileges, Linux per-process resource limits are what exists.
+
 ## Network
 
 The jail has no network route of its own. In the default `filtered` mode it only reaches an egress
@@ -126,12 +140,45 @@ a soft replacement is refused.
 Other backends (`docker`, `ssh`, `modal`) run the same worker model against their respective
 isolation primitive; `docker` additionally denies network access under `lockdown`.
 
+## MCP servers
+
+A `stdio` MCP server that Vectora has not verified (community-listed, unsigned, or with verification
+unavailable) **only starts inside the jail**, with no option to run loose on the computer. Because
+the MCP protocol is bidirectional, the server runs as a child process of the client, in the same
+jail as the workspace: read-only system, empty `$HOME`, no backend keys, seccomp, Landlock,
+`no_new_privs`, resource limits and a filtered network. Details:
+
+- The server's working folder is its own, in `~/.vectora/mcp-sandbox/<name>`.
+- The environment variables you approved for the server reach it; nothing else from the backend's
+  environment does.
+- The program has to be visible: what lives on the system (`/usr`, `/bin`) already is; what lives in
+  user folders (nvm, pyenv, uv) has its install folder mounted read-only.
+- The network is the filtered one: package registries plus the server's `allow_hosts` field
+  (`domain.com` or `*.domain.com`).
+- Without `bwrap` (for example, outside Linux) the server **does not start**, instead of falling
+  back to an unprotected process. An external launcher, if configured, still takes precedence.
+
+## State, audit and preview
+
+In **Settings → Sandbox** you see what isolation guarantees, dimension by dimension (files, network,
+environment, seccomp, Landlock, `no_new_privs`, resources and `.git`), measured on the running jail
+or estimated when it has not started, and never marked effective without confirmation. The same
+screen edits your policy, shows what the repository asked for and was ignored, displays the `bwrap`
+command preview (nothing is executed, values coming from the host are hidden) and the audit.
+
+The audit is a hash-chained `~/.vectora/sandbox-audit.jsonl` file: each record carries the hash of
+the previous one, so altering, removing or reordering a line breaks the chain and the verification
+points to where. It records the jail start (with the policy fingerprint and isolation state),
+refusals, every allowed or blocked outbound connection and policy changes. Secrets are masked.
+Terminal approval is only waived when the jail is alive, natively isolated and the network is under
+control (off or filtered).
+
 ## Interactive terminal
 
 The Terminal tab (PTY) runs in the same `bwrap` jail of the `local` backend, with the same clean
-environment and the same filtered network. On the `docker`, `ssh` and `modal` backends it is not
-supported yet: starting the interactive terminal returns a clear error rather than falling back to
-an unprotected shell.
+environment, the same seccomp, Landlock and limits, and the same filtered network. On the `docker`,
+`ssh` and `modal` backends it is not supported yet: starting the interactive terminal returns a
+clear error rather than falling back to an unprotected shell.
 
 ## See also
 

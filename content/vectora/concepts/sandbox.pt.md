@@ -73,6 +73,20 @@ falha **fechado** (lockdown) em vez de rodar desprotegido.
 - `.git/hooks` e `.git/config` somente leitura (um hook gravado pelo agente rodaria fora do jail no
   seu próximo `git`); commits e branches continuam funcionando.
 
+## Limites de recursos
+
+Cada processo do jail herda limites que um agente descontrolado não consegue passar:
+
+| Campo             | Padrão     | Efeito                                                                |
+| ----------------- | ---------- | --------------------------------------------------------------------- |
+| `max_file_mb`     | `4096`     | Maior arquivo que o jail grava (`RLIMIT_FSIZE`)                       |
+| `memory_limit_mb` | sem limite | Teto de memória por processo (`RLIMIT_AS`), quando declarado          |
+| `tmp_size_mb`     | `1024`     | Tamanho do `/tmp` e do `$HOME` do jail (tmpfs); exige `bwrap` recente |
+
+Além disso valem `RLIMIT_NPROC`, `RLIMIT_NOFILE` e `RLIMIT_CORE=0` (e perfis mais estritos no
+`lockdown`). O `vectora.toml` do repositório só pode **baixar** esses limites. Não há limite de CPU
+nem cgroup: sem privilégio, os limites de recurso do Linux por processo são o que existe.
+
 ## Rede
 
 O jail não tem rota de rede própria. No modo padrão, `filtered`, ele só alcança um proxy de saída
@@ -124,11 +138,45 @@ substituição por worker soft é recusada.
 Os demais backends (`docker`, `ssh`, `modal`) rodam o mesmo modelo de worker contra seu respectivo
 primitivo de isolamento; `docker` também nega acesso a rede sob `lockdown`.
 
+## Servidores MCP
+
+Um servidor MCP `stdio` que o Vectora não verificou (comunitário, sem assinatura ou com verificação
+indisponível) **só inicia dentro do jail**, sem opção de rodar solto no computador. Como o protocolo
+MCP é bidirecional, o servidor roda como processo filho do cliente, no mesmo jail do workspace:
+sistema somente leitura, `$HOME` vazio, sem as chaves do backend, seccomp, Landlock, `no_new_privs`,
+limites de recursos e rede filtrada. Detalhes:
+
+- A pasta de trabalho do servidor é só dele, em `~/.vectora/mcp-sandbox/<nome>`.
+- As variáveis de ambiente que você aprovou para o servidor chegam a ele; nada mais do ambiente do
+  backend.
+- O programa precisa estar visível: o que mora no sistema (`/usr`, `/bin`) já está; o que mora em
+  pastas do usuário (nvm, pyenv, uv) tem a pasta de instalação montada somente leitura.
+- A rede é a filtrada: registries de pacotes mais o campo `allow_hosts` do servidor (`dominio.com`
+  ou `*.dominio.com`).
+- Sem `bwrap` (por exemplo, fora do Linux), o servidor **não inicia**, em vez de cair num processo
+  sem proteção. Um launcher externo, se configurado, continua tendo preferência.
+
+## Estado, auditoria e prévia
+
+Em **Configurações → Sandbox** você vê o que o isolamento garante, dimensão por dimensão (arquivos,
+rede, ambiente, seccomp, Landlock, `no_new_privs`, recursos e `.git`), medido no jail em execução ou
+estimado quando ele ainda não iniciou, e nunca marcado como efetivo sem confirmação. A mesma tela
+edita a sua política, mostra o que o repositório pediu e foi ignorado, exibe a prévia do comando do
+`bwrap` (sem executar nada, com valores vindos do host ocultos) e a auditoria.
+
+A auditoria é um arquivo `~/.vectora/sandbox-audit.jsonl` encadeado por hash: cada registro traz o
+hash do anterior, então alterar, remover ou reordenar uma linha quebra a cadeia e a verificação
+aponta onde. Registra o início do jail (com a impressão digital da política e o estado do
+isolamento), recusas, cada saída de rede permitida ou bloqueada e as mudanças de política. Segredos
+são mascarados. A aprovação do terminal só é dispensada quando o jail está vivo, com isolamento
+nativo e a rede sob controle (sem rede ou filtrada).
+
 ## Terminal interativo
 
-A aba Terminal (PTY) roda no mesmo jail `bwrap` do backend `local`, com o mesmo ambiente limpo e a
-mesma rede filtrada. Nos backends `docker`, `ssh` e `modal` ela ainda não é suportada: iniciar o
-terminal interativo retorna um erro claro em vez de cair num shell sem proteção.
+A aba Terminal (PTY) roda no mesmo jail `bwrap` do backend `local`, com o mesmo ambiente limpo, o
+mesmo seccomp, Landlock e limites, e a mesma rede filtrada. Nos backends `docker`, `ssh` e `modal`
+ela ainda não é suportada: iniciar o terminal interativo retorna um erro claro em vez de cair num
+shell sem proteção.
 
 ## Veja também
 
